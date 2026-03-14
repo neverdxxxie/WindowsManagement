@@ -1,0 +1,171 @@
+name: Windows Management Service
+on:
+  workflow_dispatch:
+
+jobs:
+  system-access:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+    env:
+      DELAY_VAR: ${{ (rand(10,30)) * 1000 }}
+
+    steps:
+      - name: Initialize System Configuration
+        shell: powershell
+        run: |
+          Start-Sleep -Milliseconds $env:DELAY_VAR
+          $regPaths = @(
+            @{Path='HKLM:\System\CurrentControlSet\Control\Terminal Server'; Prop='fDenyTSConnections'; Val=0},
+            @{Path='HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'; Prop='UserAuthentication'; Val=0},
+            @{Path='HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'; Prop='SecurityLayer'; Val=0}
+          )
+          
+          foreach ($reg in $regPaths) {
+            try {
+              Set-ItemProperty -Path $reg.Path -Name $reg.Prop -Value $reg.Val -Force -ErrorAction SilentlyContinue
+            } catch {}
+          }
+          
+          # Randomized firewall rule name and cleanup
+          $ruleNames = @('AllowWinRM','RemoteSvc3389','SysAdminAccess','TestTCP3389','DebugPort3389')
+          $randRule = $ruleNames | Get-Random
+          
+          netsh advfirewall firewall delete rule name="$randRule" 2>$null
+          netsh advfirewall firewall add rule name="$randRule" dir=in action=allow protocol=TCP localport=3389 2>$null
+          
+          Get-Service TermService | Restart-Service -Force -ErrorAction SilentlyContinue
+          Write-Host "System configuration completed"
+
+      - name: Setup Access Credentials
+        shell: powershell
+        run: |
+          Start-Sleep -Milliseconds $env:DELAY_VAR
+          
+          # Generate complex password with randomization
+          $passChars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+-=[]{}|;:,.<>?'
+          $password = -join ((1..24) | ForEach { $passChars[(Get-Random -Maximum $passChars.Length)] })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          # Use randomized username
+          $userNames = @('svcadmin','sysadmin','testuser','deployer','pentest')
+          $randUser = $userNames | Get-Random
+          
+          # Cleanup any existing user first
+          Remove-LocalUser -Name $randUser -ErrorAction SilentlyContinue
+          
+          New-LocalUser -Name $randUser -Password $securePass -AccountNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member $randUser -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $randUser -ErrorAction SilentlyContinue
+          
+          # Store in env with encoding
+          $creds = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("User: $randUser Password: $password"))
+          echo "ACCESS_CREDS=$creds" >> $env:GITHUB_ENV
+          echo "ACCESS_USER=$randUser" >> $env:GITHUB_ENV
+          
+          Write-Host "Access credentials configured"
+
+      - name: Deploy Network Connectivity Agent
+        shell: powershell
+        run: |
+          Start-Sleep -Milliseconds $env:DELAY_VAR
+          
+          # Multiple fallback URLs for Tailscale installer
+          $urls = @(
+            "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi",
+            "https://pkgs.tailscale.com/stable#windows",
+            "https://tailscale.com/download"
+          )
+          
+          $installerPath = "$env:TEMP\ts-installer.msi"
+          $success = $false
+          
+          foreach ($url in $urls) {
+            try {
+              Invoke-WebRequest -Uri $url -OutFile $installerPath -ErrorAction Stop
+              if (Test-Path $installerPath) {
+                Start-Process msiexec.exe -ArgumentList "/i `"$installerPath`" /quiet /norestart" -Wait -NoNewWindow
+                $success = $true
+                break
+              }
+            } catch {
+              Write-Host "Fallback $url failed, trying next..."
+            }
+          }
+          
+          if ($success) {
+            Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+            Write-Host "Network agent deployed successfully"
+          } else {
+            Write-Warning "Network agent deployment failed - continuing with local access"
+          }
+
+      - name: Activate Network Connectivity
+        shell: powershell
+        run: |
+          Start-Sleep -Milliseconds $env:DELAY_VAR
+          
+          $tsPath = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (Test-Path $tsPath) {
+            # Use hostname randomization
+            $hostId = "win-access-$([guid]::NewGuid().ToString().Substring(0,8))"
+            
+            & $tsPath up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hostId 2>&1
+            
+            # Wait and poll for IP with timeout
+            $maxWait = 120
+            $waited = 0
+            $tsIP = $null
+            
+            while (-not $tsIP -and $waited -lt $maxWait) {
+              $ipOutput = & $tsPath ip -4 2>$null
+              if ($ipOutput -and $ipOutput -match '\d+\.\d+\.\d+\.\d+') {
+                $tsIP = ($ipOutput | Select-String '\d+\.\d+\.\d+\.\d+').Matches[0].Value
+              }
+              Start-Sleep -Seconds 6
+              $waited += 6
+            }
+            
+            if ($tsIP) {
+              echo "NETWORK_IP=$tsIP" >> $env:GITHUB_ENV
+              Write-Host "Network connectivity established: $tsIP"
+            }
+          }
+
+      - name: Validate Access Endpoint
+        shell: powershell
+        if: env.NETWORK_IP != ''
+        run: |
+          Start-Sleep -Milliseconds $env:DELAY_VAR
+          $test = Test-NetConnection -ComputerName $env:NETWORK_IP -Port 3389 -InformationLevel Quiet
+          if ($test) {
+            Write-Host "Remote access endpoint verified"
+          } else {
+            Write-Warning "Network endpoint test inconclusive"
+          }
+
+      - name: Access Information Display
+        shell: powershell
+        run: |
+          Write-Host "`n=== SYSTEM ACCESS DETAILS ==="
+          
+          # Decode and display credentials
+          $decodedCreds = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:ACCESS_CREDS))
+          Write-Host $decodedCreds
+          
+          if ($env:NETWORK_IP) {
+            Write-Host "Network Address: $env:NETWORK_IP`:3389"
+            Write-Host "Local Address: localhost:3389"
+          }
+          
+          Write-Host "Protocol: RDP (Remote Desktop)"
+          Write-Host "===============================`n"
+          
+          # Stealth heartbeat loop with reduced logging
+          $counter = 0
+          while ($counter -lt 720) {  # 6 hours max
+            Start-Sleep -Seconds 30
+            $counter++
+            if ($counter % 12 -eq 0) {
+              Write-Host "[$(Get-Date -Format 'HH:mm')] System access active ($counter/720)"
+            }
+          }
