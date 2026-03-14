@@ -43,7 +43,7 @@ jobs:
           Start-Sleep -Milliseconds $env:DELAY_MS
           
           $chars='ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789!@#$%^&*'
-          $pwd = -join((1..20)|%{ $chars[Get-Random -Max $chars.Length] })
+          $pwd = -join (Get-Random -Count 20 -InputObject ($chars.ToCharArray()))
           $spwd = ConvertTo-SecureString $pwd -AsPlainText -Force
           
           $uname = 'mgmtuser'
