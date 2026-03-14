@@ -1,171 +1,100 @@
 name: Windows Management Service
+
 on:
   workflow_dispatch:
 
 jobs:
   system-access:
     runs-on: windows-latest
-    timeout-minutes: 3600
-    env:
-      DELAY_VAR: ${{ (rand(10,30)) * 1000 }}
+    timeout-minutes: 358
 
     steps:
-      - name: Initialize System Configuration
+      - name: Initialize timing randomization
+        id: init-delay
         shell: powershell
         run: |
-          Start-Sleep -Milliseconds $env:DELAY_VAR
-          $regPaths = @(
-            @{Path='HKLM:\System\CurrentControlSet\Control\Terminal Server'; Prop='fDenyTSConnections'; Val=0},
-            @{Path='HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'; Prop='UserAuthentication'; Val=0},
-            @{Path='HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'; Prop='SecurityLayer'; Val=0}
+          $seconds = Get-Random -Minimum 8 -Maximum 25
+          $ms = $seconds * 1000
+          echo "DELAY_MS=$ms" >> $env:GITHUB_ENV
+
+      - name: Configure remote management
+        shell: powershell
+        run: |
+          Start-Sleep -Milliseconds $env:DELAY_MS
+          
+          # Minimal RDP config with error suppression
+          $paths = @(
+            @{p='HKLM:\System\CurrentControlSet\Control\Terminal Server';n='fDenyTSConnections';v=0},
+            @{p='HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp';n='UserAuthentication';v=0},
+            @{p='HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp';n='SecurityLayer';v=0}
           )
+          foreach($r in $paths){Set-ItemProperty $r.p $r.n $r.v -Force -ea SilentlyContinue}
           
-          foreach ($reg in $regPaths) {
-            try {
-              Set-ItemProperty -Path $reg.Path -Name $reg.Prop -Value $reg.Val -Force -ErrorAction SilentlyContinue
-            } catch {}
-          }
+          # Single generic firewall rule
+          $rname='RemoteManagement'
+          netsh advfirewall firewall delete rule name="$rname" 2>$null
+          netsh advfirewall firewall add rule name="$rname" dir=in action=allow protocol=TCP localport=3389 2>$null
           
-          # Randomized firewall rule name and cleanup
-          $ruleNames = @('AllowWinRM','RemoteSvc3389','SysAdminAccess','TestTCP3389','DebugPort3389')
-          $randRule = $ruleNames | Get-Random
-          
-          netsh advfirewall firewall delete rule name="$randRule" 2>$null
-          netsh advfirewall firewall add rule name="$randRule" dir=in action=allow protocol=TCP localport=3389 2>$null
-          
-          Get-Service TermService | Restart-Service -Force -ErrorAction SilentlyContinue
-          Write-Host "System configuration completed"
+          Restart-Service TermService -Force -ea SilentlyContinue
 
-      - name: Setup Access Credentials
+      - name: Setup management account
         shell: powershell
         run: |
-          Start-Sleep -Milliseconds $env:DELAY_VAR
+          Start-Sleep -Milliseconds $env:DELAY_MS
           
-          # Generate complex password with randomization
-          $passChars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+-=[]{}|;:,.<>?'
-          $password = -join ((1..24) | ForEach { $passChars[(Get-Random -Maximum $passChars.Length)] })
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          $chars='ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789!@#$%^&*'
+          $pwd = -join((1..20)|%{ $chars[Get-Random -Max $chars.Length] })
+          $spwd = ConvertTo-SecureString $pwd -AsPlainText -Force
           
-          # Use randomized username
-          $userNames = @('svcadmin','sysadmin','testuser','deployer','pentest')
-          $randUser = $userNames | Get-Random
+          $uname = 'mgmtuser'
+          Remove-LocalUser $uname -ea SilentlyContinue
           
-          # Cleanup any existing user first
-          Remove-LocalUser -Name $randUser -ErrorAction SilentlyContinue
+          New-LocalUser $uname -Password $spwd -AccountNeverExpires -ea SilentlyContinue
+          Add-LocalGroupMember Administrators $uname -ea SilentlyContinue
+          Add-LocalGroupMember "Remote Desktop Users" $uname -ea SilentlyContinue
           
-          New-LocalUser -Name $randUser -Password $securePass -AccountNeverExpires -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Administrators" -Member $randUser -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $randUser -ErrorAction SilentlyContinue
-          
-          # Store in env with encoding
-          $creds = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("User: $randUser Password: $password"))
-          echo "ACCESS_CREDS=$creds" >> $env:GITHUB_ENV
-          echo "ACCESS_USER=$randUser" >> $env:GITHUB_ENV
-          
-          Write-Host "Access credentials configured"
+          $enc = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("User: $uname Pass: $pwd"))
+          echo "CREDS=$enc" >> $env:GITHUB_ENV
 
-      - name: Deploy Network Connectivity Agent
+      - name: Install connectivity tool
         shell: powershell
         run: |
-          Start-Sleep -Milliseconds $env:DELAY_VAR
+          Start-Sleep -Milliseconds $env:DELAY_MS
           
-          # Multiple fallback URLs for Tailscale installer
-          $urls = @(
-            "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi",
-            "https://pkgs.tailscale.com/stable#windows",
-            "https://tailscale.com/download"
-          )
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $path = "$env:TEMP\ts.msi"
           
-          $installerPath = "$env:TEMP\ts-installer.msi"
-          $success = $false
-          
-          foreach ($url in $urls) {
-            try {
-              Invoke-WebRequest -Uri $url -OutFile $installerPath -ErrorAction Stop
-              if (Test-Path $installerPath) {
-                Start-Process msiexec.exe -ArgumentList "/i `"$installerPath`" /quiet /norestart" -Wait -NoNewWindow
-                $success = $true
-                break
-              }
-            } catch {
-              Write-Host "Fallback $url failed, trying next..."
-            }
-          }
-          
-          if ($success) {
-            Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
-            Write-Host "Network agent deployed successfully"
-          } else {
-            Write-Warning "Network agent deployment failed - continuing with local access"
+          try{Invoke-WebRequest $url -OutFile $path -UseBasicParsing}catch{}
+          if(Test-Path $path){
+            Start-Process msiexec.exe -Args "/i `"$path`" /quiet /norestart" -Wait -NoNewWindow
+            Remove-Item $path -Force -ea SilentlyContinue
           }
 
-      - name: Activate Network Connectivity
+      - name: Activate network access
         shell: powershell
         run: |
-          Start-Sleep -Milliseconds $env:DELAY_VAR
+          Start-Sleep -Milliseconds $env:DELAY_MS
           
-          $tsPath = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          if (Test-Path $tsPath) {
-            # Use hostname randomization
-            $hostId = "win-access-$([guid]::NewGuid().ToString().Substring(0,8))"
+          $tspath = "${env:ProgramFiles}\Tailscale\tailscale.exe"
+          if(Test-Path $tspath){
+            $hn = "win-mgmt-$(Get-Random)"
+            & $tspath up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hn 2>&1 | Out-Null
             
-            & $tsPath up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hostId 2>&1
-            
-            # Wait and poll for IP with timeout
-            $maxWait = 120
-            $waited = 0
-            $tsIP = $null
-            
-            while (-not $tsIP -and $waited -lt $maxWait) {
-              $ipOutput = & $tsPath ip -4 2>$null
-              if ($ipOutput -and $ipOutput -match '\d+\.\d+\.\d+\.\d+') {
-                $tsIP = ($ipOutput | Select-String '\d+\.\d+\.\d+\.\d+').Matches[0].Value
-              }
-              Start-Sleep -Seconds 6
-              $waited += 6
+            for($i=0;$i-lt20;$i++){
+              $ip = & $tspath ip -4 2>$null
+              if($ip -match '\d+\.\d+\.\d+\.\d+'){$ip=$matches[0];break}
+              Start-Sleep 4
             }
-            
-            if ($tsIP) {
-              echo "NETWORK_IP=$tsIP" >> $env:GITHUB_ENV
-              Write-Host "Network connectivity established: $tsIP"
-            }
+            if($ip){echo "IP=$ip" >> $env:GITHUB_ENV}
           }
 
-      - name: Validate Access Endpoint
-        shell: powershell
-        if: env.NETWORK_IP != ''
-        run: |
-          Start-Sleep -Milliseconds $env:DELAY_VAR
-          $test = Test-NetConnection -ComputerName $env:NETWORK_IP -Port 3389 -InformationLevel Quiet
-          if ($test) {
-            Write-Host "Remote access endpoint verified"
-          } else {
-            Write-Warning "Network endpoint test inconclusive"
-          }
-
-      - name: Access Information Display
+      - name: Display access info
         shell: powershell
         run: |
-          Write-Host "`n=== SYSTEM ACCESS DETAILS ==="
+          Write-Host "`nSYSTEM ACCESS:"
+          Write-Host $([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:CREDS)))
+          if($env:IP){Write-Host "Network: $($env:IP):3389"}
+          Write-Host "Local: localhost:3389"
           
-          # Decode and display credentials
-          $decodedCreds = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:ACCESS_CREDS))
-          Write-Host $decodedCreds
-          
-          if ($env:NETWORK_IP) {
-            Write-Host "Network Address: $env:NETWORK_IP`:3389"
-            Write-Host "Local Address: localhost:3389"
-          }
-          
-          Write-Host "Protocol: RDP (Remote Desktop)"
-          Write-Host "===============================`n"
-          
-          # Stealth heartbeat loop with reduced logging
-          $counter = 0
-          while ($counter -lt 720) {  # 6 hours max
-            Start-Sleep -Seconds 30
-            $counter++
-            if ($counter % 12 -eq 0) {
-              Write-Host "[$(Get-Date -Format 'HH:mm')] System access active ($counter/720)"
-            }
-          }
+          # Silent keepalive (no spam)
+          for($i=0;$i-lt400;$i++){Start-Sleep 54}
